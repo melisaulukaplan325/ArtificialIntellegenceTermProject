@@ -1,0 +1,66 @@
+from rdkit import Chem
+from rdkit.Chem import AllChem
+import torch
+from torch_geometric.data import Data
+
+# 1. Define the Feature Extractor (The "3D" Logic)
+def get_3d_enriched_features(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if not mol: return None
+    mol = Chem.AddHs(mol) # Add Hydrogens for 3D accuracy
+    
+    # Try to generate 3D coords; if it fails, return None (skip molecule)
+    try:
+        AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+        AllChem.ComputeGasteigerCharges(mol)
+    except:
+        return None
+
+    node_features = []
+    for atom in mol.GetAtoms():
+        # Feature 1: Atomic Number (Basic)
+        atomic_num = atom.GetAtomicNum()
+        
+        # Feature 2: Partial Charge (3D Electronic)
+        # Using a default of 0.0 if calculation failed for some reason
+        try:
+            charge = float(atom.GetProp('_GasteigerCharge'))
+        except:
+            charge = 0.0
+            
+        # Feature 3: Chirality (3D Geometric)
+        chiral_tag = atom.GetChiralTag()
+        chirality = 1 if chiral_tag != Chem.CHI_UNSPECIFIED else 0
+        
+        # Combine into a vector
+        node_features.append([atomic_num, charge, chirality])
+        
+    return torch.tensor(node_features, dtype=torch.float)
+
+# 2. Apply this to the Tox21 Dataset
+print("Upgrading dataset with 3D features (Chirality & Partial Charges)...")
+
+enriched_data_list = []
+# We access the raw SMILES strings from the dataset
+# Note: In standard MoleculeNet, smiles might be in dataset.smiles or data.smiles depending on version.
+# If dataset.smiles exists:
+for i in range(len(dataset)):
+    data = dataset[i]
+    # MoleculeNet often stores the SMILES in the 'smiles' attribute if loaded correctly
+    # If not, you might need to load from the raw CSV file directly.
+    # Assuming 'smiles' is available:
+    smiles = data.smiles 
+    
+    new_x = get_3d_enriched_features(smiles)
+    
+    if new_x is not None:
+        # Overwrite the default 2D features with our new 3D features
+        data.x = new_x 
+        enriched_data_list.append(data)
+
+# Update the dataset with only the successfully processed 3D graphs
+dataset = enriched_data_list
+print(f"Successfully converted {len(dataset)} molecules to 3D representation.")
+
+# Now continue to creating DataLoaders...
+# train_loader = DataLoader(dataset[:train_size], ...)
