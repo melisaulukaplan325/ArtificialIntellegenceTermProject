@@ -1,0 +1,119 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.datasets import MoleculeNet
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GATConv, global_mean_pool # Switched to GAT
+from sklearn.metrics import roc_auc_score, recall_score, f1_score
+import numpy as np
+import time
+
+# 1. Device and Dataset (using the same Tox21 dataset)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+dataset = MoleculeNet(root='./data/Tox21', name='Tox21')
+NUM_TASKS = dataset.num_classes
+
+# --- ENHANCEMENT: Class Weights for Weighted BCE ---
+# To address class imbalance[cite: 170, 173], we calculate weights for the 'Active' class.
+# In Tox21, 'Active' (1) is rare compared to 'Inactive' (0).
+def compute_class_weights(dataset):
+    # This logic finds the ratio of inactive to active samples for each task
+    all_y = torch.cat([data.y for data in dataset], dim=0)
+    weights = []
+    for i in range(NUM_TASKS):
+        task_y = all_y[:, i]
+        pos = torch.sum(task_y == 1).item()
+        neg = torch.sum(task_y == 0).item()
+        # Weight = Negatives / Positives (handles imbalance)
+        weight = neg / pos if pos > 0 else 1.0
+        weights.append(weight)
+    return torch.tensor(weights).to(device)
+
+POS_WEIGHTS = compute_class_weights(dataset)
+
+# 2. Model Definition: Enhanced GAT Architecture
+class EnhancedGATClassifier(nn.Module):
+    def __init__(self, num_features, hidden_channels, num_tasks):
+        super(EnhancedGATClassifier, self).__init__()
+        # ENHANCEMENT: Using GATConv with Multi-head Attention
+        # 5 Layers instead of 3 to capture long-range structural dependencies 
+        self.conv1 = GATConv(num_features, hidden_channels, heads=4, concat=True)
+        self.conv2 = GATConv(hidden_channels * 4, hidden_channels, heads=4, concat=True)
+        self.conv3 = GATConv(hidden_channels * 4, hidden_channels, heads=4, concat=True)
+        self.conv4 = GATConv(hidden_channels * 4, hidden_channels, heads=4, concat=True)
+        self.conv5 = GATConv(hidden_channels * 4, hidden_channels, heads=1, concat=False)
+
+        self.lin = nn.Linear(hidden_channels, num_tasks)
+
+    def forward(self, data):
+        x, edge_index, batch = data.x.float(), data.edge_index, data.batch
+
+        # Message Passing with Attention
+        x = F.elu(self.conv1(x, edge_index)) # ELU often works better with GAT
+        x = F.elu(self.conv2(x, edge_index))
+        x = F.elu(self.conv3(x, edge_index))
+        x = F.elu(self.conv4(x, edge_index))
+        x = self.conv5(x, edge_index)
+
+        # Global Pooling (Graph-level representation) [cite: 65]
+        x = global_mean_pool(x, batch) 
+
+        # Classification Head
+        return self.lin(x)
+
+# 3. Enhanced Training with Weighted Loss
+model = EnhancedGATClassifier(dataset.num_features, 64, NUM_TASKS).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=5e-4)
+
+# ENHANCEMENT: pos_weight handles the class imbalance 
+criterion = nn.BCEWithLogitsLoss(reduction='none', pos_weight=POS_WEIGHTS)
+
+def train(loader):
+    model.train()
+    total_loss = 0
+    for data in loader:
+        data = data.to(device)
+        optimizer.zero_grad()
+        out = model(data)
+        y = data.y.float()
+
+        # Masking missing labels
+        is_labeled = ~torch.isnan(y)
+        loss_matrix = criterion(out, y)
+        loss = loss_matrix[is_labeled].mean()
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+# 4. Enhanced Evaluation (AUC + Recall + F1)
+def evaluate_detailed(loader):
+    model.eval()
+    y_true, y_prob = [], []
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            out = model(data)
+            y_prob.append(torch.sigmoid(out).cpu().numpy())
+            y_true.append(data.y.cpu().numpy())
+
+    y_true = np.concatenate(y_true, axis=0)
+    y_prob = np.concatenate(y_prob, axis=0)
+    y_pred = (y_prob > 0.5).astype(int)
+
+    metrics = {'auc': [], 'recall': [], 'f1': []}
+    for i in range(NUM_TASKS):
+        mask = ~np.isnan(y_true[:, i])
+        true, prob, pred = y_true[mask, i], y_prob[mask, i], y_pred[mask, i]
+        
+        if len(np.unique(true)) == 2:
+            metrics['auc'].append(roc_auc_score(true, prob))
+            metrics['recall'].append(recall_score(true, pred))
+            metrics['f1'].append(f1_score(true, pred))
+
+    return {k: np.mean(v) for k, v in metrics.items()}
+
+# --- Execute Training Loop ---
+# (Standard loop using the train and evaluate_detailed functions above)
